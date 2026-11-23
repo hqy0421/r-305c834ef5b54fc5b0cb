@@ -8,6 +8,7 @@ package trdsql
 // Make a table from json
 // or make the result of json filter by jq.
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,9 @@ type JSONReader struct {
 	types     []string
 	limitRead bool
 	needNULL  bool
+	// keep is the set of column names to import.
+	// A nil keep means no field pruning (import every field).
+	keep map[string]bool
 }
 
 // NewJSONReader returns a JSONReader configured with input options and jq filter.
@@ -36,6 +40,7 @@ func NewJSONReader(reader io.Reader, opts *ReadOpts) (*JSONReader, error) {
 	r.reader = json.NewDecoder(reader)
 	r.reader.UseNumber()
 	r.already = make(map[string]bool)
+	r.keep = columnKeepSet(opts.InColumns)
 	var top any
 
 	if opts.InJQuery != "" {
@@ -181,6 +186,13 @@ func (r *JSONReader) ReadRow(row []any) ([]any, error) {
 		return nil, io.EOF
 	}
 
+	if r.query == nil && r.keep != nil {
+		// Field pruning fast path: decode only the retained fields so that
+		// large pruned values (for example attachments) are skipped as raw
+		// bytes instead of being fully unmarshaled.
+		return r.readRowPruned(row)
+	}
+
 	var data any
 	if err := r.reader.Decode(&data); err != nil {
 		return nil, err
@@ -190,6 +202,41 @@ func (r *JSONReader) ReadRow(row []any) ([]any, error) {
 		return r.jqueryRunJsonl(row, data)
 	}
 	return r.rowParse(row, data), nil
+}
+
+// readRowPruned decodes a stream object while materializing only retained fields.
+func (r *JSONReader) readRowPruned(row []any) ([]any, error) {
+	var raw json.RawMessage
+	if err := r.reader.Decode(&raw); err != nil {
+		return nil, err
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil || obj == nil {
+		// A top-level non-object value (scalar/array): fall back to the
+		// generic representation under the synthetic "c1" column.
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.UseNumber()
+		var data any
+		if err := dec.Decode(&data); err != nil {
+			return nil, fmt.Errorf("%w: %s", ErrInvalidJSON, err)
+		}
+		return r.rowParse(row, data), nil
+	}
+	for i, name := range r.names {
+		value, ok := obj[name]
+		if !ok {
+			row[i] = nil
+			continue
+		}
+		dec := json.NewDecoder(bytes.NewReader(value))
+		dec.UseNumber()
+		var v any
+		if err := dec.Decode(&v); err != nil {
+			return nil, fmt.Errorf("%w: %s", ErrInvalidJSON, err)
+		}
+		row[i] = r.jsonString(v)
+	}
+	return row, nil
 }
 
 func (r *JSONReader) rowParse(row []any, jsonRow any) []any {
@@ -212,6 +259,10 @@ func (r *JSONReader) objectRow(obj map[string]any) (map[string]any, []string, er
 	names := make([]string, 0, len(obj))
 	row := make(map[string]any)
 	for k, v := range obj {
+		if r.keep != nil && !r.keep[k] {
+			// Field pruning: skip columns the query never references.
+			continue
+		}
 		names = append(names, k)
 		row[k] = r.jsonString(v)
 	}
@@ -224,10 +275,31 @@ func (r *JSONReader) etcRow(val any) (map[string]any, []string, error) {
 	//  ["b"]]
 	var names []string
 	k := "c1"
-	names = append(names, k)
 	row := make(map[string]any)
+	if r.keep != nil && !r.keep[k] {
+		return row, names, nil
+	}
+	names = append(names, k)
 	row[k] = r.jsonString(val)
 	return row, names, nil
+}
+
+// columnKeepSet converts an explicit column list into a lookup set.
+// It returns nil for an empty list, which disables field pruning.
+func columnKeepSet(columns []string) map[string]bool {
+	if len(columns) == 0 {
+		return nil
+	}
+	keep := make(map[string]bool, len(columns))
+	for _, column := range columns {
+		if column != "" {
+			keep[column] = true
+		}
+	}
+	if len(keep) == 0 {
+		return nil
+	}
+	return keep
 }
 
 // jqueryRun is a gojq.Run for json.

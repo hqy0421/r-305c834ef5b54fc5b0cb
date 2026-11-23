@@ -127,6 +127,13 @@ type ReadOpts struct {
 
 	// InRowNumber indicates whether to add a row number column.
 	InRowNumber bool
+
+	// InColumns limits the imported fields to the listed column names.
+	// It is empty by default, meaning every field is imported.
+	// When set, readers that support field pruning (JSON/JSONL) import
+	// only these columns, skipping large unused fields such as attachments.
+	// Nested fields are preserved when their top-level column is retained.
+	InColumns []string
 }
 
 // NewReadOpts returns a ReadOpts.
@@ -224,6 +231,14 @@ func IsTemporary(t bool) ReadOpt {
 func InRowNumber(t bool) ReadOpt {
 	return func(args *ReadOpts) {
 		args.InRowNumber = t
+	}
+}
+
+// InColumns restricts the imported fields to the listed column names.
+// An empty list disables field pruning and imports every field.
+func InColumns(columns []string) ReadOpt {
+	return func(args *ReadOpts) {
+		args.InColumns = columns
 	}
 }
 

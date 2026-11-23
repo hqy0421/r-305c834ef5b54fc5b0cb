@@ -83,6 +83,7 @@ func (cli Cli) Run(args []string) int {
 		inLimitRead int
 		inNull      nilString
 		inRowNumber bool
+		inColumns   string
 
 		outFlag         outputFlag
 		outFile         string
@@ -125,6 +126,7 @@ func (cli Cli) Run(args []string) int {
 	flags.StringVar(&inJQuery, "ijq", "", "jq expression string for input(JSON/JSONL only).")
 	flags.Var(&inNull, "inull", "value(string) to convert to null on input.")
 	flags.BoolVar(&inRowNumber, "inum", false, "add row number column.")
+	flags.StringVar(&inColumns, "icolumns", "", "comma separated column names to import (field pruning, JSON/JSONL).")
 
 	flags.BoolVar(&inFlag.CSV, "icsv", false, "CSV format for input.")
 	flags.BoolVar(&inFlag.LTSV, "iltsv", false, "LTSV format for input.")
@@ -252,6 +254,7 @@ func (cli Cli) Run(args []string) int {
 		trdsql.InNeedNULL(inNull.valid),
 		trdsql.InNULL(inNull.str),
 		trdsql.InRowNumber(inRowNumber),
+		trdsql.InColumns(parseInColumns(inColumns)),
 	)
 
 	writer := cli.OutStream
@@ -507,6 +510,28 @@ type inputFlag struct {
 	WIDTH  bool
 	TEXT   bool
 	LOGFMT bool
+}
+
+// parseInColumns splits the -icolumns value into a deduplicated column list.
+// An empty value returns nil, which disables manual field pruning.
+func parseInColumns(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	seen := make(map[string]bool)
+	columns := make([]string, 0)
+	for _, column := range strings.Split(value, ",") {
+		column = strings.TrimSpace(column)
+		if column == "" || seen[column] {
+			continue
+		}
+		seen[column] = true
+		columns = append(columns, column)
+	}
+	if len(columns) == 0 {
+		return nil
+	}
+	return columns
 }
 
 // inputFormat returns the input format selected by flags.

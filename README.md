@@ -197,6 +197,7 @@ trdsql -o[output format] -t [input filename]
 * `-ih` the first line is interpreted as column names(CSV only).
 * `-id` **character** field delimiter for input(default ",")(CSV only).
 * `-ijq` **string** jq expression string for input(JSON/JSONL only).
+* `-icolumns` **string** comma separated column names to import. Only the listed fields are read (JSON/JSONL field pruning); empty (default) imports every field.
 * `-ilr` **int** limited number of rows to read.
 * `-inull` **string** value(string) to convert to null on input.
 * `-inum` add row number column.
@@ -658,6 +659,52 @@ $ trdsql -ojsonl "SELECT * FROM test.csv"
 {"c1":"2","c2":"Melon"}
 {"c1":"3","c2":"Apple"}
 ```
+
+####  4.11.1. <a name='field-pruning'></a>Field pruning (large JSON/JSONL files)
+
+Device JSONL files often contain dozens of columns where a single field
+(for example a base64 attachment) dwarfs the rest of the row. When a report
+only joins the device code and the date, parsing and importing the unused
+fields is wasted work. trdsql can import only the fields the query needs.
+
+Two ways to control the imported fields are available.
+
+**1. Explicit query columns (automatic).** When the SQL statement names its
+columns explicitly, the referenced column names (including those in `WHERE`,
+`GROUP BY`, `ORDER BY` and join `ON` clauses) are detected automatically and
+only those fields are read:
+
+```console
+$ trdsql "SELECT device_id, event_date FROM device.jsonl"
+```
+
+The filter and grouping columns are retained, so connection and aggregation
+results are identical to a full import. Nested fields stay intact: a retained
+top-level column such as `meta` is still imported as its complete JSON text.
+
+**2. Manual declaration with `-icolumns`.** Declare the fields explicitly when
+you want full control, or when the query cannot be analyzed automatically:
+
+```console
+$ trdsql -icolumns device_id,event_date "SELECT * FROM device.jsonl"
+```
+
+A manual declaration always takes precedence over automatic detection.
+
+**Star query fallback.** Any `*` query (`SELECT *`, `t.*`, `COUNT(*)` ...), a
+subquery, or anything else that cannot be analyzed conservatively falls back to
+importing every field, preserving the original behavior. In other words,
+field pruning never changes the query result; it only reduces the columns held
+in the temporary table:
+
+```console
+$ trdsql "SELECT * FROM device.jsonl"          # every column is imported
+$ trdsql "SELECT count(*) FROM device.jsonl"   # star aggregate: full import
+```
+
+As a library, the same behavior is available through the
+`trdsql.InColumns([]string{...})` read option; leaving it empty enables
+automatic detection with the star-query fallback.
 
 ###  4.12. <a name='yaml'></a>YAML
 

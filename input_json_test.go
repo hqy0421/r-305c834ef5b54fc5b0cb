@@ -278,6 +278,179 @@ func TestNewJSONReader(t *testing.T) {
 	}
 }
 
+func TestNewJSONReaderWithColumnPruning(t *testing.T) {
+	jsonl := `
+{"device_id":"d1","event_date":"2026-01-01","payload":{"temp":1},"attachment":"AAAA"}
+{"device_id":"d2","event_date":"2026-01-02","payload":{"temp":2},"attachment":"BBBB"}
+{"device_id":"d3","event_date":"2026-01-03","payload":{"temp":3},"attachment":"CCCC"}`
+	// rowMap converts a positional row into a name-keyed map because JSON
+	// object key order (and therefore trdsql column order) is not stable.
+	rowMap := func(names []string, row []any) map[string]any {
+		m := make(map[string]any, len(names))
+		for i, name := range names {
+			m[name] = row[i]
+		}
+		return m
+	}
+	t.Run("prunePreRead", func(t *testing.T) {
+		reader, err := NewJSONReader(
+			strings.NewReader(jsonl),
+			NewReadOpts(InColumns([]string{"device_id", "event_date"})),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		names, _ := reader.Names()
+		if !arraySortEqual(t, names, []string{"device_id", "event_date"}) {
+			t.Errorf("names = %v", names)
+		}
+		pre := reader.PreReadRow()
+		want := map[string]any{"device_id": "d1", "event_date": "2026-01-01"}
+		if !reflect.DeepEqual(rowMap(names, pre[0]), want) {
+			t.Errorf("PreReadRow() = %v, want %v", pre, want)
+		}
+	})
+	t.Run("pruneStreamRows", func(t *testing.T) {
+		reader, err := NewJSONReader(
+			strings.NewReader(jsonl),
+			NewReadOpts(InColumns([]string{"device_id", "event_date"})),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		names, _ := reader.Names()
+		row := make([]any, 2)
+		var got []map[string]any
+		for {
+			r, err := reader.ReadRow(row)
+			if err != nil {
+				break
+			}
+			got = append(got, rowMap(names, append([]any(nil), r...)))
+		}
+		want := []map[string]any{
+			{"device_id": "d2", "event_date": "2026-01-02"},
+			{"device_id": "d3", "event_date": "2026-01-03"},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("ReadRow() = %v, want %v", got, want)
+		}
+	})
+	t.Run("nestedFieldPreserved", func(t *testing.T) {
+		reader, err := NewJSONReader(
+			strings.NewReader(jsonl),
+			NewReadOpts(InColumns([]string{"device_id", "payload"})),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		names, _ := reader.Names()
+		if !arraySortEqual(t, names, []string{"device_id", "payload"}) {
+			t.Errorf("names = %v", names)
+		}
+		pre := reader.PreReadRow()
+		if len(pre) != 1 || len(pre[0]) != 2 {
+			t.Fatalf("PreReadRow() = %v", pre)
+		}
+		want := map[string]any{"device_id": "d1", "payload": `{"temp":1}`}
+		if got := rowMap(names, pre[0]); !reflect.DeepEqual(got, want) {
+			t.Errorf("PreReadRow() = %v, want %v", got, want)
+		}
+	})
+	t.Run("missingColumnIsNULL", func(t *testing.T) {
+		reader, err := NewJSONReader(
+			strings.NewReader(jsonl),
+			NewReadOpts(InColumns([]string{"device_id", "absent"})),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		names, _ := reader.Names()
+		row := make([]any, 2)
+		r, err := reader.ReadRow(row)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := rowMap(names, r)
+		if got["device_id"] != "d2" || got["absent"] != nil {
+			t.Errorf("ReadRow() = %v, want device_id=d2 absent=nil", got)
+		}
+	})
+	t.Run("numericValueMatchesFullPath", func(t *testing.T) {
+		numeric := `{"id":1,"big":100000000000000000000,"drop":"x"}` + "\n" +
+			`{"id":2,"big":2.5,"drop":"y"}`
+		pruned, err := NewJSONReader(
+			strings.NewReader(numeric),
+			NewReadOpts(InColumns([]string{"id", "big"})),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		full, err := NewJSONReader(
+			strings.NewReader(numeric),
+			NewReadOpts(),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Consume the preread row and compare the streamed rows.
+		_ = pruned.PreReadRow()
+		_ = full.PreReadRow()
+		prunedRow := make([]any, 2)
+		fullRow := make([]any, 3)
+		pr, _ := pruned.ReadRow(prunedRow)
+		fr, _ := full.ReadRow(fullRow)
+		// Full path columns are id, big, drop; compare the first two by name.
+		fullNames, _ := full.Names()
+		fullMap := map[string]any{}
+		for i, n := range fullNames {
+			if n == "id" || n == "big" {
+				fullMap[n] = fr[i]
+			}
+		}
+		prunedNames, _ := pruned.Names()
+		prunedMap := map[string]any{}
+		for i, n := range prunedNames {
+			prunedMap[n] = pr[i]
+		}
+		if !reflect.DeepEqual(prunedMap, fullMap) {
+			t.Errorf("numeric mismatch: pruned=%v full=%v", prunedMap, fullMap)
+		}
+	})
+	t.Run("jsonArrayPruned", func(t *testing.T) {
+		array := `[{"device_id":"d1","attachment":"X"},{"device_id":"d2","attachment":"Y"}]`
+		reader, err := NewJSONReader(
+			strings.NewReader(array),
+			NewReadOpts(InPreRead(2), InColumns([]string{"device_id"})),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		names, _ := reader.Names()
+		if !arraySortEqual(t, names, []string{"device_id"}) {
+			t.Errorf("names = %v", names)
+		}
+		pre := reader.PreReadRow()
+		want := [][]any{{"d1"}, {"d2"}}
+		if !reflect.DeepEqual(pre, want) {
+			t.Errorf("PreReadRow() = %v, want %v", pre, want)
+		}
+	})
+	t.Run("scalarArrayFallbackColumn", func(t *testing.T) {
+		reader, err := NewJSONReader(
+			strings.NewReader(`["a","b"]`),
+			NewReadOpts(InColumns([]string{"c1"})),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		names, _ := reader.Names()
+		if !arraySortEqual(t, names, []string{"c1"}) {
+			t.Errorf("names = %v", names)
+		}
+	})
+}
+
 func TestNewJSONReaderWithNULL(t *testing.T) {
 	type args struct {
 		reader io.Reader

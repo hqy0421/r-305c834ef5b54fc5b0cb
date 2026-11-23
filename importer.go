@@ -97,8 +97,23 @@ func (i *ReadFormat) ImportContext(ctx context.Context, db *DB, query string) (s
 		return query, nil
 	}
 
+	// Determine the fields actually required by the query so that large
+	// unused columns (for example JSON attachments) can be skipped.
+	// Explicitly declared columns always take precedence. A nil result
+	// (star query, subquery, or anything ambiguous) falls back to
+	// importing every field, preserving the original behavior.
+	readOpts := i.ReadOpts
+	if len(readOpts.InColumns) == 0 {
+		if columns := QueryColumns(query); len(columns) > 0 {
+			optsCopy := *readOpts
+			optsCopy.InColumns = columns
+			readOpts = &optsCopy
+			debug.Printf("Pruned import columns: [%s]", strings.Join(columns, ","))
+		}
+	}
+
 	for fileName := range tables {
-		tableName, err := ImportFileContext(ctx, db, fileName, i.ReadOpts)
+		tableName, err := ImportFileContext(ctx, db, fileName, readOpts)
 		if err != nil {
 			return query, err
 		}
